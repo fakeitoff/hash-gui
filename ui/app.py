@@ -545,6 +545,11 @@ class App(tk.Tk):
         self._recompute(paths)
 
     def _recompute(self, paths):
+        if self._busy():
+            # 运行中再开一个会把 self.runner 换掉：旧的那个没人能取消，
+            # 两个进程同时往同一批 Entry 上写，「停止」也只能停掉新的。
+            self.status_text.set("正在计算中，请先点「停止」或等这一批跑完")
+            return
         algs = self.selected_algorithms()
         for key in paths:
             entry = self.entries.get(key)
@@ -771,6 +776,16 @@ class App(tk.Tk):
                 open_in_explorer(key)
                 return
 
+    # 以这些字符开头的单元格会被 Excel/Sheets 当公式执行（CSV 注入）。
+    # 文件名是外部可控的（比如给一整包下载文件出报告），所以必须中和。
+    _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+    def _csv_cell(self, value: str) -> str:
+        text = str(value)
+        if text.startswith(self._FORMULA_TRIGGERS):
+            text = "\t" + text          # 前置制表符：不触发公式，肉眼几乎无差
+        return '"' + text.replace('"', '""') + '"'
+
     def _export(self):
         if not self.entries:
             self.status_text.set("没有可导出的结果")
@@ -790,7 +805,7 @@ class App(tk.Tk):
                     for e in entries:
                         row = [e.name, str(e.size), human_time(e.mtime)] + \
                               [self._show(e.hash_of(a)) for a in algs]
-                        fh.write(",".join('"' + c.replace('"', '""') + '"' for c in row) + "\n")
+                        fh.write(",".join(self._csv_cell(c) for c in row) + "\n")
                 else:
                     fh.write(f"{self.sevenzip_version or self.sevenzip_path}\n")
                     fh.write("生成时间：" + time.strftime("%Y-%m-%d %H:%M:%S") + "\n\n")
@@ -838,6 +853,8 @@ class App(tk.Tk):
                     self._write_log(event[1], event[2])
                 elif kind == "result":
                     entry = event[1]
+                    if entry.path not in self.entries:
+                        continue        # 用户已删掉这一行，别让回来的结果把它复活
                     self.entries[entry.path] = entry
                     if self.tree.exists(entry.path):
                         values = list(self.tree.item(entry.path, "values"))

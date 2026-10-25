@@ -355,6 +355,40 @@ def main():
     check("界面进度条走到 100%（回调签名含 fraction）",
           abs(app._progress_shown - 100.0) < 0.01 and app.percent_text.get() == "100%",
           f"{app._progress_shown:.1f}% / {app.percent_text.get()}")
+
+    # 回归点 1：运行中再触发一次计算会把 self.runner 换掉，旧 runner 没人能取消，
+    # 两个进程同时往同一批 Entry 上写。
+    class BusyRunner:
+        def is_alive(self):
+            return True
+
+    saved_runner = app.runner
+    saved_status = app.status_text.get()
+    app.runner = BusyRunner()
+    app._recompute([norm_key(made["dir1/same.bin"])])
+    check("运行中拒绝再开一个任务（否则旧任务无法取消）",
+          isinstance(app.runner, BusyRunner) and "正在计算中" in app.status_text.get(),
+          app.status_text.get())
+    app.runner = saved_runner
+    app.status_text.set(saved_status)     # 别把状态栏污染给后面的断言
+
+    # 回归点 2：运行中删掉的行，迟到的结果不能把它复活
+    ghost = stat_entry(made["dir1/same.bin"])
+    ghost.hashes = {"SHA256": "A" * 64}
+    app.entries.pop(ghost.path, None)
+    app._queue.put(("result", ghost))
+    for _ in range(10):
+        app.update()
+        time.sleep(0.05)
+    check("已删除的行不会被迟到的结果复活",
+          ghost.path not in app.entries, str(len(app.entries)))
+
+    # 回归点 3：CSV 公式注入 —— 文件名可能来自别人打包给你的目录
+    check("CSV 单元格防公式注入",
+          app._csv_cell("=1+1.csv") == '"\t=1+1.csv"'
+          and app._csv_cell("+a") == '"\t+a"' and app._csv_cell("-a") == '"\t-a"'
+          and app._csv_cell("@a") == '"\t@a"' and app._csv_cell("normal.bin") == '"normal.bin"'
+          and app._csv_cell('a"b') == '"a""b"', app._csv_cell("=1+1.csv"))
     marks = [app.tree.item(iid, "values")[0] for iid in rows]
     check("重复文件在「标记」列被点名",
           any("组 1" in str(m) for m in marks), str([m for m in marks if m][:2]))
