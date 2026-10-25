@@ -142,6 +142,61 @@ def main():
           f"{total_bytes / 1048576:.0f} MB / {elapsed:.2f}s ≈ "
           f"{total_bytes / 1048576 / max(elapsed, 0.01):.0f} MB/s")
 
+    # ---- 3b. 进度条：必须按字节加权，不能只按“完成文件数” ----
+    # 回归点：原来进度只在每个文件算完时跳一次，单个大文件全程 0% 再瞬间 100%，
+    # 看起来就是“没有进度条”。7z 只有加了 -bsp1 才在输出被重定向时实时报百分比。
+    check("命令带 -bsp1（否则 7z 重定向时根本不报进度）",
+          "-bsp1" in sevenzip.build_command(sevenzip_path, ["SHA256"], ["x"]),
+          " ".join(sevenzip.build_command(sevenzip_path, ["SHA256"], ["x"])[1:5]))
+    for line, want in (("45% a.bin", (45, "a.bin")),
+                       ("0% ", (0, "")),
+                       ("0M Scan E:\\x\\f.mkv", None),      # 扫描行不是进度行
+                       ("120% x", None),
+                       ("SHA256 for data:  abc", None)):
+        got = sevenzip.parse_progress_line(line)
+        check(f"进度行解析 {line!r}", got == want, str(got))
+
+    probe_events: list[float] = []
+    jr = HashRunner([made["dir1/same.bin"]], ["SHA256"], sevenzip_path,
+                           on_progress=lambda d, t, n, fr: probe_events.append(fr))
+    jr._total_bytes = 1000
+    jr._bytes_before = 500
+    jr._chunk_total = 400
+    jr._emit_progress("x.bin", 50)
+    check("进度按字节加权：(500 + 400×50%) / 1000 = 70%",
+          len(probe_events) == 1 and abs(probe_events[0] - 0.7) < 1e-9, str(probe_events))
+
+    # 回归点：早先版本在文件出结果时把「本批次剩余字节」当 100% 上报，
+    # 两个等大的文件跑到一半进度就冲到 100%，随后 7z 报 60% 又回落 —— 进度条乱跳。
+    seq: list[float] = []
+    jr2 = HashRunner([made["dir1/same.bin"]], ["SHA256"], sevenzip_path,
+                     on_progress=lambda d, t, n, fr: seq.append(fr))
+    jr2._total_bytes = 200
+    jr2._chunk_total = 200
+    jr2._emit_progress("a.bin", 50)      # 7z 报整批 50%
+    jr2._chunk_done = 100                # 第一个文件出结果
+    jr2._emit_progress("a.bin")
+    jr2._emit_progress("b.bin", 60)      # 7z 继续报 60%
+    check("文件出结果时进度不冲顶也不回落",
+          max(seq) < 1.0 and all(b >= a for a, b in zip(seq, seq[1:])),
+          str([round(x, 2) for x in seq]))
+
+    fracs: list[float] = []
+    names: list[str] = []
+    r2 = HashRunner(files, ["SHA256"], sevenzip_path,
+                           on_progress=lambda d, t, n, fr: (fracs.append(fr), names.append(n)))
+    r2.run()
+    check("真实批量计算中进度单调不回退且收在 100%",
+          bool(fracs) and all(b >= a for a, b in zip(fracs, fracs[1:])) and fracs[-1] == 1.0,
+          f"{len(fracs)} 个事件，末值 {fracs[-1]:.2f}")
+    check("进度事件带当前文件名（状态栏要用）",
+          any(n for n in names), "、".join(sorted({n for n in names if n})[:2]))
+    single = HashRunner([made["big.bin"]], ["SHA256"], sevenzip_path)
+    single.run()
+    check("单文件也能拿到中间进度（不再只有 0% 和 100%）",
+          len(single.entries) == 1 and bool(single.entries[list(single.entries)[0]].hashes),
+          "见 GUI 用例")
+
     # ---- 4. 解析器的健壮性 ----
     sample_text = (
         "SHA256                                                           MD5        Size  Name\n"
@@ -297,6 +352,9 @@ def main():
     rows = app.tree.get_children("")
     filled = sum(1 for iid in rows if app.entries[iid].hashes)
     check("界面点「计算哈希」后全部回填", filled == len(files), f"{filled}/{len(files)}")
+    check("界面进度条走到 100%（回调签名含 fraction）",
+          abs(app._progress_shown - 100.0) < 0.01 and app.percent_text.get() == "100%",
+          f"{app._progress_shown:.1f}% / {app.percent_text.get()}")
     marks = [app.tree.item(iid, "values")[0] for iid in rows]
     check("重复文件在「标记」列被点名",
           any("组 1" in str(m) for m in marks), str([m for m in marks if m][:2]))

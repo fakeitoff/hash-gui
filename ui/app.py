@@ -111,6 +111,8 @@ class App(tk.Tk):
         self.runner: HashRunner | None = None
         self._queue: queue.Queue = queue.Queue()
         self._analysis_dirty = False
+        self._progress_shown = 0.0
+        self._run_started = time.time()
         self._last_dir = str(settings.get("last_dir") or "")
 
         self.algorithm_vars: dict[str, tk.BooleanVar] = {}
@@ -554,10 +556,13 @@ class App(tk.Tk):
         self.btn_stop.configure(state="normal")
         self.progress.configure(value=0)
         self.percent_text.set("0%")
+        self._progress_shown = 0.0
+        self._run_started = time.time()
         self.runner = HashRunner(
             paths, algs, self.sevenzip_path,
             on_result=lambda e: self._queue.put(("result", e)),
-            on_progress=lambda done, total, name: self._queue.put(("progress", done, total, name)),
+            on_progress=lambda done, total, name, fraction: self._queue.put(
+                ("progress", done, total, name, fraction)),
             on_log=lambda line, kind="info": self._queue.put(("log", line, kind)),
             on_finished=lambda ok, msg: self._queue.put(("finished", ok, msg)),
         )
@@ -846,11 +851,19 @@ class App(tk.Tk):
                                        tags=("error",) if entry.error and not entry.hashes else ())
                     self._mark_dirty()
                 elif kind == "progress":
-                    done, total, name = event[1], event[2], event[3]
-                    percent = done * 100.0 / max(1, total)
+                    done, total, name, fraction = event[1], event[2], event[3], event[4]
+                    percent = fraction * 100.0
+                    if percent < self._progress_shown:      # 进度条只前进，不回退
+                        percent = self._progress_shown
+                    self._progress_shown = percent
                     self.progress.configure(value=percent)
                     self.percent_text.set(f"{percent:.0f}%")
-                    self.status_text.set(f"正在计算 {name}（{done}/{total}）")
+                    bits = [f"正在计算 {name}" if name else "正在计算", f"{done}/{total}"]
+                    if 0.03 < fraction < 0.999:
+                        elapsed = max(0.1, time.time() - self._run_started)
+                        left = elapsed / fraction - elapsed
+                        bits.append(f"预计还需 {left:.0f}s" if left >= 1 else "即将完成")
+                    self.status_text.set("  ·  ".join(bits))
                 elif kind == "caps":
                     self._apply_capabilities(event[1])
                 elif kind == "finished":

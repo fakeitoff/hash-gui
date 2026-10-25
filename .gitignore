@@ -1,4 +1,10 @@
 __pycache__/
 *.pyc
+*.egg-info/
 temp/
 settings.json
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp

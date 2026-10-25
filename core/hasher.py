@@ -51,7 +51,8 @@ class HashRunner(threading.Thread):
         self.algorithms = list(algorithms or ["SHA256"])
         self.sevenzip_path = sevenzip_path
         self.on_result = on_result or (lambda entry: None)
-        self.on_progress = on_progress or (lambda done, total, name: None)
+        # on_progress(已完成文件数, 文件总数, 当前文件名, 0~1 的整体进度)
+        self.on_progress = on_progress or (lambda done, total, name, fraction: None)
         self.on_log = on_log or (lambda line, kind="info": None)
         self.on_finished = on_finished or (lambda ok, msg: None)
 
@@ -59,6 +60,12 @@ class HashRunner(threading.Thread):
         self._stop_event = threading.Event()
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self._total_bytes = 0
+        self._bytes_before = 0
+        self._chunk_total = 0         # 本批次原始总字节（整个批次内不变）
+        self._chunk_done = 0          # 本批次里已出结果的文件字节
+        self._last_percent = 0        # 7z 最近一次报告的批次百分比
+        self._done_files = 0
 
     # -- 控制 -------------------------------------------------------------
     def cancel(self):
@@ -89,6 +96,9 @@ class HashRunner(threading.Thread):
         by_path = {p: stat_entry(p) for p in self.paths}
         self.entries = by_path
         readable = [p for p in self.paths if not by_path[p].error]
+        self._total_bytes = sum(by_path[p].size for p in readable) or 1
+        self._bytes_before = sum(by_path[p].size for p in by_path if p not in set(readable))
+        self._done_files = total - len(readable)
 
         self.on_log(f"$ {os.path.basename(self.sevenzip_path)} h "
                     f"{' '.join('-scrc' + a for a in self.algorithms)} "
@@ -97,7 +107,12 @@ class HashRunner(threading.Thread):
         for base, relative, absolute in sevenzip.plan_batches(readable):
             if self._stop_event.is_set():
                 break
+            self._chunk_total = sum(by_path[p].size for p in absolute)
+            self._chunk_done = 0
+            self._last_percent = 0
             self._run_chunk(base, relative, absolute, by_path)
+            self._bytes_before += self._chunk_total
+        self._emit_progress("", 100)
 
         done = sum(1 for e in by_path.values() if e.hashes)
         for entry in by_path.values():
@@ -135,6 +150,7 @@ class HashRunner(threading.Thread):
 
         warnings: dict[str, str] = {}
         in_warnings = False
+        rows_seen = 0
         try:
             for raw in proc.stdout:
                 if self._stop_event.is_set():
@@ -156,6 +172,9 @@ class HashRunner(threading.Thread):
                     continue
                 found = sevenzip.parse_row(stripped, self.algorithms, base)
                 if not found:
+                    prog = sevenzip.parse_progress_line(stripped)
+                    if prog:
+                        self._emit_progress(prog[1], prog[0])
                     continue
                 key, hashes = found
                 entry = by_path.get(key)
@@ -163,9 +182,11 @@ class HashRunner(threading.Thread):
                     entry = by_path.setdefault(key, Entry(path=key))
                 entry.hashes = hashes
                 entry.error = ""
+                rows_seen += 1
                 self.on_result(entry)
-                self.on_progress(sum(1 for e in by_path.values() if e.hashes),
-                                 len(by_path), entry.name)
+                self._chunk_done += entry.size
+                self._done_files += 1
+                self._emit_progress(entry.name)
         finally:
             with self._lock:
                 self._proc = None
@@ -180,3 +201,25 @@ class HashRunner(threading.Thread):
                 continue
             entry.error = warnings.get(path) or "7z 未返回结果（文件不存在或被占用）"
             self.on_log(f"✗ {entry.name} —— {entry.error}", "error")
+        # 没出结果的文件也算“已处理完”，否则文件计数会一直差几个
+        self._done_files += max(0, len(absolute) - rows_seen)
+
+    def _emit_progress(self, name: str, percent=None):
+        """按**字节加权**汇报整体进度（0~1）。
+
+        只按“完成文件数”算的话，单个大文件从头到尾都停在 0%、最后一格跳满，
+        看起来就像没有进度条。7z 的 ``-bsp1`` 会实时吐 ``45% 文件名``，
+        但那个百分比是**整批**的，所以这里取两者的较大值：
+
+            批次内已出结果的文件字节   vs   批次总字节 × 7z 报的百分比
+
+        只用后者会在文件刚出结果时把进度报低；只用前者（早期版本的写法）
+        会在批次中途冲到 100% 再回落 —— 两个坑都得避开。
+        """
+        if percent is not None:
+            self._last_percent = max(self._last_percent, max(0, min(100, percent)))
+        in_chunk = max(float(self._chunk_done),
+                       self._chunk_total * self._last_percent / 100.0)
+        fraction = ((self._bytes_before + in_chunk) / self._total_bytes
+                    if self._total_bytes else 1.0)
+        self.on_progress(self._done_files, len(self.paths), name, max(0.0, min(1.0, fraction)))

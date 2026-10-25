@@ -153,12 +153,29 @@ def build_command(sevenzip: str, algorithms, paths) -> list[str]:
 
     ``-sccUTF-8`` 必须带：7z 默认按控制台 OEM 码页输出（中文 Windows 是 GBK），
     不带这个开关时中文文件名会解出乱码，路径也就对不回去了。
+
+    ``-bsp1`` 把进度行显式送到 stdout。不带的话 7z 在输出被重定向时不报进度，
+    整个表等到算完才一次性刷出来 —— 单个大文件就表现为进度条一直 0% 然后跳 100%。
     """
     cmd = [sevenzip, "h"]
     cmd += [f"-scrc{alg}" for alg in algorithms]
-    cmd += ["-sccUTF-8"]
+    cmd += ["-sccUTF-8", "-bsp1"]
     cmd += list(paths)
     return cmd
+
+
+_PROGRESS_RE = re.compile(r"^(\d{1,3})%(?:\s+(.*))?$")
+
+
+def parse_progress_line(line: str):
+    """解析 7z 的进度行 ``45% 文件名``，返回 ``(百分比, 当前文件)``；不是进度行返回 None。"""
+    m = _PROGRESS_RE.match(line.strip())
+    if not m:
+        return None
+    percent = int(m.group(1))
+    if percent > 100:
+        return None
+    return percent, (m.group(2) or "").strip()
 
 
 def plan_batches(paths) -> list[tuple[str, list[str], list[str]]]:
